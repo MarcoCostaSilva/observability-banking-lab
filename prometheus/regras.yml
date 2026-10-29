@@ -1,0 +1,130 @@
+groups:
+  # ---------------------------------------------------------------- SLIs (recording rules)
+  - name: slis
+    rules:
+      - record: servico:requisicoes:taxa5m
+        expr: sum by (servico, operacao) (rate(http_requests_total[5m]))
+      - record: servico:erros_5xx:razao5m
+        expr: |
+          sum by (servico, operacao) (rate(http_requests_total{status=~"5.."}[5m]))
+          / sum by (servico, operacao) (rate(http_requests_total[5m]))
+      - record: servico:latencia_p99:5m
+        expr: histogram_quantile(0.99, sum by (le, servico, operacao) (rate(http_request_duration_seconds_bucket[5m])))
+
+  # ---------------------------------------------------------------- Alarmes
+  - name: alarmes
+    rules:
+      # ===== CRÍTICOS =====
+      - alert: ServicoForaDoAr
+        expr: up == 0
+        for: 1m
+        labels: {severidade: critico}
+        annotations:
+          summary: "{{ $labels.job }} não responde ao scrape"
+
+      - alert: MovimentacaoBurnRateAlto          # SLO 99,9% => budget 0,1%; 14,4x
+        expr: |
+          (sum(rate(http_requests_total{operacao="movimentacao",status=~"5.."}[5m]))
+            / sum(rate(http_requests_total{operacao="movimentacao"}[5m])) > 0.0144)
+          and
+          (sum(rate(http_requests_total{operacao="movimentacao",status=~"5.."}[1h]))
+            / sum(rate(http_requests_total{operacao="movimentacao"}[1h])) > 0.0144)
+        for: 2m
+        labels: {severidade: critico}
+        annotations:
+          summary: "Movimentação consumindo o error budget 14x mais rápido que o aceitável"
+
+      - alert: MovimentacaoErroAlto
+        expr: servico:erros_5xx:razao5m{operacao="movimentacao"} > 0.02
+        for: 2m
+        labels: {severidade: critico}
+        annotations:
+          summary: "Movimentação com {{ $value | humanizePercentage }} de erros 5xx"
+
+      - alert: MovimentacaoLatenciaP99Alta
+        expr: servico:latencia_p99:5m{operacao="movimentacao"} > 0.8
+        for: 2m
+        labels: {severidade: critico}
+        annotations:
+          summary: "p99 da movimentação em {{ $value | humanizeDuration }} (limite 800ms)"
+
+      - alert: MovimentacaoSemTrafego
+        expr: |
+          sum(rate(http_requests_total{operacao="movimentacao"}[5m])) == 0
+          or absent(http_requests_total{operacao="movimentacao"})
+        for: 3m
+        labels: {severidade: critico}
+        annotations:
+          summary: "Sem requisições de movimentação (queda silenciosa ou carga parada)"
+
+      - alert: FraudeBloqueioLento              # alinhado ao SLO: 99,5% dos bloqueios em ate 2 s
+        expr: |
+          ((sum(increase(bloqueio_fraude_efetivacao_seconds_count[1h]))
+            - sum(increase(bloqueio_fraude_efetivacao_seconds_bucket{le="2.0"}[1h])))
+            / sum(increase(bloqueio_fraude_efetivacao_seconds_count[1h])) > 0.05)
+          and sum(increase(bloqueio_fraude_efetivacao_seconds_count[1h])) >= 20
+        labels: {severidade: critico}
+        annotations:
+          summary: "Mais de 5% dos bloqueios por fraude acima de 2 s em 1 h (minimo de 20 bloqueios)"
+
+      - alert: FraudeFalhas
+        expr: sum(increase(http_requests_total{operacao="bloqueio_fraude",status=~"5.."}[15m])) >= 3
+        labels: {severidade: critico}
+        annotations:
+          summary: "3 ou mais falhas no bloqueio por fraude em 15 min (alerta por contagem)"
+
+      - alert: InconsistenciaClienteConta
+        expr: increase(inconsistencias_cliente_conta_total[15m]) > 0
+        labels: {severidade: critico}
+        annotations:
+          summary: "Cliente inativado com conta(s) ainda ativa(s): cascata falhou"
+
+      # ===== AVISOS =====
+      - alert: PoolConexoesSaturado
+        expr: db_pool_em_uso / db_pool_capacidade > 0.8
+        for: 2m
+        labels: {severidade: aviso}
+        annotations:
+          summary: "Pool de conexões de {{ $labels.servico }} acima de 80%"
+
+      - alert: CancelamentoFalhas                 # ~8 req/h: janela de 1h, contagem absoluta
+        expr: sum(increase(http_requests_total{operacao="cancelamento",status=~"5.."}[1h])) >= 3
+        labels: {severidade: aviso}
+        annotations:
+          summary: "3 ou mais falhas de cancelamento em 1h"
+
+      - alert: CadastroErrosAltos                 # só avalia a taxa com volume mínimo
+        expr: |
+          (sum(increase(http_requests_total{operacao="cadastro",status=~"5.."}[30m]))
+            / sum(increase(http_requests_total{operacao="cadastro"}[30m])) > 0.05)
+          and sum(increase(http_requests_total{operacao="cadastro"}[30m])) >= 20
+        labels: {severidade: aviso}
+        annotations:
+          summary: "Cadastro de contas com mais de 5% de erros (mínimo 20 requisições)"
+
+      - alert: InclusaoClienteErrosAltos
+        expr: |
+          (sum(increase(http_requests_total{operacao="inclusao_cliente",status=~"5.."}[30m]))
+            / sum(increase(http_requests_total{operacao="inclusao_cliente"}[30m])) > 0.05)
+          and sum(increase(http_requests_total{operacao="inclusao_cliente"}[30m])) >= 20
+        labels: {severidade: aviso}
+        annotations:
+          summary: "Inclusão de clientes com mais de 5% de erros (mínimo 20 requisições)"
+
+      # ===== ANOMALIAS (negócio) =====
+      - alert: QuedaAbruptaMovimentacoes
+        expr: |
+          sum(rate(movimentacoes_total[5m])) < 0.5 * sum(rate(movimentacoes_total[5m] offset 15m))
+          and sum(rate(movimentacoes_total[5m] offset 15m)) > 1
+        for: 5m
+        labels: {severidade: aviso}
+        annotations:
+          summary: "Volume de movimentações caiu mais de 50% frente a 15 min atrás"
+
+      - alert: PicoBloqueiosFraude
+        expr: |
+          sum(increase(bloqueios_fraude_total[15m])) > 3 * sum(increase(bloqueios_fraude_total[15m] offset 1h))
+          and sum(increase(bloqueios_fraude_total[15m])) >= 10
+        labels: {severidade: aviso}
+        annotations:
+          summary: "Bloqueios por fraude 3x acima do padrão de 1h atrás"
